@@ -35,7 +35,12 @@ pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(Lab3_digi2 Lab3_digi2.c )
+add_executable(Lab3_digi2 
+        Lab3_digi2.c 
+        lib/utils_tx/utils_tx.c 
+        lib/utils_rx/utils_rx.c
+        lib/utils_codec/utils_codec.c
+        )
 
 pico_set_program_name(Lab3_digi2 "Lab3_digi2")
 pico_set_program_version(Lab3_digi2 "0.1")
@@ -46,7 +51,11 @@ pico_enable_stdio_usb(Lab3_digi2 1)
 
 # Add the standard library to the build
 target_link_libraries(Lab3_digi2
-        pico_stdlib)
+        pico_stdlib
+        hardware_pwm
+        hardware_gpio
+        hardware_clocks
+        )
 
 # Add the standard include files to the build
 target_include_directories(Lab3_digi2 PRIVATE
@@ -54,4 +63,5 @@ target_include_directories(Lab3_digi2 PRIVATE
 )
 
 pico_add_extra_outputs(Lab3_digi2)
+
 
