@@ -1,6 +1,6 @@
 /**
  * @file utils_tx.h
- * @brief TX por PWM (polling) + protocolo simple con checksum XOR.
+ * @brief Transmisor UAPWMC por PWM (polling de ciclos).
  */
 #ifndef UTILS_TX_H_
 #define UTILS_TX_H_
@@ -8,37 +8,53 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* ---------------- Config del protocolo (duty) ---------------- */
-#define UAPWMC_DUTY_IDLE        0.10f   /* 10%  */
-#define UAPWMC_DUTY_START       0.20f   /* 20%  */
-#define UAPWMC_DUTY_STOP        0.80f   /* 80%  */
+/* Duty de control: toma los de tu codec (codif.h) */
+#ifndef CODIF_DUTY_START
+  #define CODIF_DUTY_START 0.97f
+#endif
+#ifndef CODIF_DUTY_STOP
+  #define CODIF_DUTY_STOP  0.88f
+#endif
+#ifndef CODIF_DUTY_IDLE
+  #define CODIF_DUTY_IDLE  0.05f
+#endif
 
-#define UAPWMC_DUTY_MIN_DATA    0.15f   /* 15%  límite inferior datos */
-#define UAPWMC_DUTY_MAX_DATA    0.75f   /* 75%  límite superior datos */
-#define UAPWMC_DUTY_SPAN_DATA   (UAPWMC_DUTY_MAX_DATA - UAPWMC_DUTY_MIN_DATA)
+#define UAPWMC_DUTY_START  CODIF_DUTY_START
+#define UAPWMC_DUTY_STOP   CODIF_DUTY_STOP
+#define UAPWMC_DUTY_IDLE   CODIF_DUTY_IDLE
 
-/* ---------------- PWM (TX) básico ---------------- */
-void     tx_pwm_init(uint32_t gpio, uint32_t f_pwm_hz, uint32_t top);
-void     tx_pwm_set_freq(uint32_t f_pwm_hz);
-void     tx_pwm_set_duty01(float duty01);
-void     tx_pwm_wait_cycles(uint8_t cycles);
-uint32_t tx_pwm_get_gpio(void);
+/* Rango para datos “continuos” (byte→duty). Puedes sobreescribirlos. */
+#ifndef UAPWMC_DATA_DMIN
+  #define UAPWMC_DATA_DMIN 0.15f
+#endif
+#ifndef UAPWMC_DATA_DMAX
+  #define UAPWMC_DATA_DMAX 0.75f
+#endif
 
-/* ---------------- Utilidades de datos ---------------- */
-static inline float  tx_duty_from_byte(uint8_t b){
-    return UAPWMC_DUTY_MIN_DATA + (UAPWMC_DUTY_SPAN_DATA * ((float)b / 255.0f));
+/** Inicializa PWM TX en @p gpio_pin a @p freq_hz. */
+void uapwmc_tx_init(uint32_t gpio_pin, uint32_t freq_hz);
+
+/** Fija duty [0..1]. */
+void uapwmc_tx_set_duty(float duty01);
+
+/** Mantiene @p duty durante @p cycles ciclos del PWM (bloqueante). */
+void tx_hold(float duty, uint8_t cycles);
+
+/** Envía trama: [IDLE][START][LEN][DATA...][CHK][STOP][IDLE]. */
+void uapwmc_tx_send_frame(const uint8_t* data, uint8_t length, uint32_t symbol_cycles);
+
+/** Byte (0..255) → duty en [UAPWMC_DATA_DMIN..UAPWMC_DATA_DMAX]. */
+static inline float uapwmc_tx_byte_to_duty(uint8_t byte){
+    const float dmin = UAPWMC_DATA_DMIN, dmax = UAPWMC_DATA_DMAX;
+    const float span = (dmax - dmin);
+    return dmin + ( (float)byte / 255.0f ) * span;
 }
-static inline uint8_t tx_checksum_xor(const uint8_t* p, size_t n){
+
+/** XOR-8 de un bloque de datos. */
+static inline uint8_t uapwmc_tx_checksum(const uint8_t* data, size_t length){
     uint8_t c = 0;
-    for(size_t i=0;i<n;++i) c ^= p[i];
+    for (size_t i=0;i<length;++i) c ^= data[i];
     return c;
 }
-
-/* ---------------- Envío de trama ----------------
-   Formato: IDLE(2c) -> START(Sc) -> LEN(1B) -> DATA(NB) -> CHK(1B) -> STOP(Sc) -> IDLE(1c)
-   Donde 'c' = ciclos PWM a sostener, 'Sc' = symbol_cycles. LEN ∈ [0..255].
-*/
-void tx_send_frame(const uint8_t* data, uint8_t len,
-                   uint8_t symbol_cycles, uint8_t data_cycles);
 
 #endif /* UTILS_TX_H_ */

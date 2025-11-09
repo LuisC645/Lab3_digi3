@@ -1,337 +1,210 @@
-// main.c — Half-Duplex Loopback con ASCII 7-bit
+/**
+ * @file practica4_digi.c
+ * @brief Chat bidireccional por PWM (TX + RX en modo Polling)
+ * @details
+ * Comunicación ASCII 7-bit (MSB3 + LSB4) usando duty PWM.
+ * Misma app sirve para dos Picos (Full-Duplex) o loopback.
+ * Correcciones:
+ * 1) Delays de TX a 5 ms para que RX por polling no pierda símbolos.
+ * 2) Reset de la MEF RX (got_msb) en START y STOP.
+ * 3) try_receive_frame() retorna true en STOP para imprimir aun con CHK ERROR.
+ */
+
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>
-#include <stdbool.h>
 #include "pico/stdlib.h"
-#include "hardware/gpio.h"
-#include "hardware/pwm.h"
 
-#include "lib/utils_rx/utils_rx.h"
-#include "lib/utils_codec/utils_codec.h"
+#include "lib/utils_tx/utils_tx.h"   // uapwmc_tx_init, uapwmc_tx_set_duty
+#include "lib/utils_rx/utils_rx.h"   // rx_polling_init, rx_get_duty_polling
+#include "lib/utils_codec/utils_codec.h"  // codec 7-bit (MSB3+LSB4)
 
-/* ===== Pines (loopback: conectar GP0→GP6 y GP1→GP7) ===== */
-#define TX1_PIN  0
-#define RX1_PIN  7
-#define TX2_PIN  1
-#define RX2_PIN  6
+#define TX_PIN        0
+#define RX_PIN        1
+#define F_PWM_INIT    1000    // 1 kHz
+#define RX_TIMEOUT_MS 120
+#define MAX_LEN       64
 
-/* ===== Protocolo ===== */
-#define PWM_TOP        999
-#define F_PWM_HZ       800
-#define SYMBOL_CYCLES  3
-#define DATA_CYCLES    3
-#define LINE_MAX       256
-#define MAX_RETRIES    3
-#define GUARD_FACTOR   0.75f
+/* Prototipos */
+static void send_frame(const char *msg);
+static bool try_receive_frame(char *out, int maxlen);
 
-/* ===== Duty Cycles Control ===== */
-#ifndef UAPWMC_DUTY_IDLE
-#define UAPWMC_DUTY_IDLE  0.10f
-#endif
-#ifndef UAPWMC_DUTY_START
-#define UAPWMC_DUTY_START 0.20f
-#endif
-#ifndef UAPWMC_DUTY_STOP
-#define UAPWMC_DUTY_STOP  0.80f
-#endif
+int main(void) {
+    stdio_init_all();
+    while (!stdio_usb_connected()) sleep_ms(100);
 
-/* ===== Debug ===== */
-#define DEBUG_VERBOSE  0  // 1 para ver cada símbolo
-#define DEBUG_ERRORS   1  // Solo errores
+    /* ----- Mensaje de bienvenida / ayuda corta ----- */
+    printf("\n====================================================\n");
+    printf(" PWM CHAT (ASCII 7-bit) — Modo Polling @ %u Hz\n", F_PWM_INIT);
+    printf(" TX: GP%d   RX: GP%d\n", TX_PIN, RX_PIN);
+    printf(" Conecta TX->RX entre Picos (o loopback con puenteado).\n");
+    printf(" Escribe un mensaje y presiona ENTER para enviarlo.\n");
+    printf("====================================================\n");
 
-/* ===== PWM ===== */
-typedef struct {
-    uint pin, slice, chan;
-    uint32_t top;
-} txpwm_t;
+    /* Inicialización */
+    uapwmc_tx_init(TX_PIN, F_PWM_INIT);
 
-static void txpwm_init(txpwm_t* h, uint pin, uint32_t f_pwm_hz, uint32_t top) {
-    h->pin   = pin;
-    h->slice = pwm_gpio_to_slice_num(pin);
-    h->chan  = pwm_gpio_to_channel(pin);
-    h->top   = top;
+    /* Línea en IDLE antes de transmitir */
+    uapwmc_tx_set_duty(CODIF_DUTY_IDLE);
+    sleep_ms(10);
 
-    gpio_set_function(pin, GPIO_FUNC_PWM);
-    gpio_set_drive_strength(pin, GPIO_DRIVE_STRENGTH_8MA);
-    gpio_set_slew_rate(pin, GPIO_SLEW_RATE_FAST);
+    rx_polling_init(RX_PIN);  // modo polling
 
-    uint32_t clk_sys = 125000000u;
-    float clkdiv = (float)clk_sys / ((float)f_pwm_hz * (float)(top + 1));
+    char tx_msg[MAX_LEN];
+    char rx_msg[MAX_LEN];
 
-    pwm_config cfg = pwm_get_default_config();
-    pwm_config_set_wrap(&cfg, top);
-    pwm_config_set_clkdiv(&cfg, clkdiv);
-    pwm_init(h->slice, &cfg, true);
+    printf("> "); fflush(stdout);
 
-    pwm_set_chan_level(h->slice, h->chan, 0);
-}
+    /* Bucle principal */
+    while (true) {
+        /* ---------- TX por consola ---------- */
+        int c = getchar_timeout_us(0);
+        static int idx = 0;
+        if (c != PICO_ERROR_TIMEOUT) {
+            if (c == '\n' || c == '\r') {
+                tx_msg[idx] = '\0';
+                if (idx > 0) {
+                    printf("\n[TX] \"%s\"\n", tx_msg);
+                    send_frame(tx_msg);
+                    printf("> ");
+                    idx = 0;
+                } else {
+                    printf("\n> ");
+                }
+            } else if (idx < MAX_LEN - 1) {
+                tx_msg[idx++] = (char)c;
+                putchar(c);
+            }
+        }
 
-static inline void txpwm_set_duty01(const txpwm_t* h, float duty01) {
-    if (duty01 < 0.f) duty01 = 0.f;
-    if (duty01 > 1.f) duty01 = 1.f;
-    uint32_t level = (uint32_t)((float)h->top * duty01 + 0.5f);
-    pwm_set_chan_level(h->slice, h->chan, level);
-}
+        /* ---------- RX por polling ---------- */
+        if (try_receive_frame(rx_msg, MAX_LEN)) {
+            printf("\n[RX] \"%s\"\n> ", rx_msg);  // imprime aun si checksum falla
+            fflush(stdout);
+        }
 
-/* ===== Timing ===== */
-static inline uint32_t Texp_us(void) {
-    return 1000000u / F_PWM_HZ;
-}
-
-static inline void wait_periods_approx(uint8_t n) {
-    uint32_t T = Texp_us();
-    for (uint8_t i = 0; i < n; i++) {
-        sleep_us(T);
+        tight_loop_contents();
     }
 }
 
-/* ===== TX/RX ASCII 7-bit ===== */
-static bool link_send_and_receive_ascii7(const txpwm_t* tx, uint rx_pin,
-                                         const char* tx_text, char* rx_text,
-                                         int n_chars) {
-    const uint32_t T = Texp_us();
-    const uint32_t guard_time = (uint32_t)(T * GUARD_FACTOR);
-    const uint32_t measure_time = T - guard_time;
+/* =======================================================
+ * Envío de trama (bloqueante) — ASCII 7-bit MSB3+LSB4
+ * ======================================================= */
+static void send_frame(const char *msg) {
+    int n = (int)strlen(msg);
+    if (n <= 0) return;
 
-    // IDLE
-    txpwm_set_duty01(tx, UAPWMC_DUTY_IDLE);
-    wait_periods_approx(2);
+    /* Checksum XOR-7 (0..127) del payload */
+    uint8_t chk7 = codif_checksum7((const uint8_t *)msg, (size_t)n);
 
-    // START
-    txpwm_set_duty01(tx, UAPWMC_DUTY_START);
-    wait_periods_approx(SYMBOL_CYCLES);
+    /* Guard IDLE */
+    uapwmc_tx_set_duty(CODIF_DUTY_IDLE);
+    sleep_ms(5);
 
-    // DATOS: 2 símbolos por carácter
-    int byte_errors = 0;
-    for (int i = 0; i < n_chars; i++) {
-        uint8_t ch_tx = (uint8_t)tx_text[i] & 0x7F;
-        float duty_msb, duty_lsb;
-        
-        // Codificar
-        codec_char_to_duties(tx_text[i], &duty_msb, &duty_lsb);
+    /* START */
+    uapwmc_tx_set_duty(CODIF_DUTY_START);
+    sleep_ms(5);
 
-#if DEBUG_VERBOSE
-        uint8_t msb3 = (ch_tx >> 4) & 0x07;
-        uint8_t lsb4 = ch_tx & 0x0F;
-        printf("[TX %d] '%c' (0x%02X) MSB3=%d LSB4=%d → d1=%.3f d2=%.3f\n",
-               i, (ch_tx >= 32 && ch_tx < 127) ? ch_tx : '.', 
-               ch_tx, msb3, lsb4, duty_msb, duty_lsb);
-#endif
+    /* DATA: cada char 7-bit = MSB3 + LSB4 */
+    for (int i = 0; i < n; i++) {
+        uint8_t b7   = (uint8_t)msg[i] & 0x7F;
+        uint8_t msb3 = (b7 >> 4) & 0x07;    // bits 6..4
+        uint8_t lsb4 =  b7       & 0x0F;    // bits 3..0
 
-        // Enviar MSB3
-        txpwm_set_duty01(tx, duty_msb);
-        sleep_us(guard_time);
-        float duty_msb_meas = rx_measure_duty_avg(rx_pin, T, DATA_CYCLES);
-        sleep_us(measure_time);
+        float d_msb = codif_msb3_to_duty(msb3);
+        float d_lsb = codif_lsb4_to_duty(lsb4);
 
-        // Enviar LSB4
-        txpwm_set_duty01(tx, duty_lsb);
-        sleep_us(guard_time);
-        float duty_lsb_meas = rx_measure_duty_avg(rx_pin, T, DATA_CYCLES);
-        sleep_us(measure_time);
-
-        // Decodificar
-        char ch_rx = codec_duties_to_char(duty_msb_meas, duty_lsb_meas);
-        rx_text[i] = ch_rx;
-
-#if DEBUG_VERBOSE
-        printf("[RX %d] d1=%.3f d2=%.3f → '%c' (0x%02X) %s\n",
-               i, duty_msb_meas, duty_lsb_meas,
-               ((uint8_t)ch_rx >= 32 && (uint8_t)ch_rx < 127) ? ch_rx : '.',
-               (uint8_t)ch_rx,
-               (ch_rx == tx_text[i]) ? "✓" : "✗");
-#endif
-
-        if (ch_rx != tx_text[i]) byte_errors++;
+        uapwmc_tx_set_duty(d_msb);
+        sleep_ms(5);
+        uapwmc_tx_set_duty(d_lsb);
+        sleep_ms(5);
     }
 
-    // CHECKSUM (también 2 símbolos)
-    uint8_t chk_tx = codec_checksum_xor7((const uint8_t*)tx_text, (size_t)n_chars);
-    float chk_duty_msb, chk_duty_lsb;
-    codec_char_to_duties((char)chk_tx, &chk_duty_msb, &chk_duty_lsb);
+    /* CHK7 también como MSB3+LSB4 */
+    uint8_t chk_msb3 = (chk7 >> 4) & 0x07;
+    uint8_t chk_lsb4 =  chk7       & 0x0F;
+    uapwmc_tx_set_duty(codif_msb3_to_duty(chk_msb3));
+    sleep_ms(5);
+    uapwmc_tx_set_duty(codif_lsb4_to_duty(chk_lsb4));
+    sleep_ms(5);
 
-#if DEBUG_VERBOSE
-    printf("[TX CHK] 0x%02X → d1=%.3f d2=%.3f\n", chk_tx, chk_duty_msb, chk_duty_lsb);
-#endif
+    /* STOP + vuelta a IDLE */
+    uapwmc_tx_set_duty(CODIF_DUTY_STOP);
+    sleep_ms(5);
 
-    // Enviar checksum MSB
-    txpwm_set_duty01(tx, chk_duty_msb);
-    sleep_us(guard_time);
-    float chk_msb_meas = rx_measure_duty_avg(rx_pin, T, DATA_CYCLES);
-    sleep_us(measure_time);
-
-    // Enviar checksum LSB
-    txpwm_set_duty01(tx, chk_duty_lsb);
-    sleep_us(guard_time);
-    float chk_lsb_meas = rx_measure_duty_avg(rx_pin, T, DATA_CYCLES);
-    sleep_us(measure_time);
-
-    // Verificar checksum
-    char chk_rx_char = codec_duties_to_char(chk_msb_meas, chk_lsb_meas);
-    uint8_t chk_rx = (uint8_t)chk_rx_char & 0x7F;
-    uint8_t chk_calc = codec_checksum_xor7((const uint8_t*)rx_text, (size_t)n_chars);
-
-#if DEBUG_VERBOSE
-    printf("[RX CHK] d1=%.3f d2=%.3f → 0x%02X (calc=0x%02X) %s\n",
-           chk_msb_meas, chk_lsb_meas, chk_rx, chk_calc,
-           (chk_rx == chk_calc) ? "✓" : "✗");
-#endif
-
-    // STOP
-    txpwm_set_duty01(tx, UAPWMC_DUTY_STOP);
-    wait_periods_approx(SYMBOL_CYCLES);
-    txpwm_set_duty01(tx, UAPWMC_DUTY_IDLE);
-    wait_periods_approx(1);
-
-    // Validar
-    bool chk_ok = (chk_rx == chk_calc);
-    bool data_ok = (byte_errors == 0);
-
-    return (data_ok && chk_ok);
+    uapwmc_tx_set_duty(CODIF_DUTY_IDLE);
 }
 
-/* ===== Transmisión con reintentos ===== */
-static bool link_send_with_retry(const txpwm_t* tx, uint rx_pin,
-                                 const char* msg, char* rx_text, int len) {
-    for (int retry = 0; retry < MAX_RETRIES; retry++) {
-        if (retry > 0) {
-#if DEBUG_ERRORS
-            printf("[RETRY %d/%d]\n", retry + 1, MAX_RETRIES);
-#endif
-            sleep_ms(10);
-        }
+/* =======================================================
+ * Recepción (Polling) — decodifica MSB3+LSB4, retorna true en STOP
+ * ======================================================= */
+static bool try_receive_frame(char *out, int maxlen) {
+    static uint8_t rx_data[MAX_LEN];
+    static int  idx        = 0;
+    static bool receiving  = false;
 
-        bool ok = link_send_and_receive_ascii7(tx, rx_pin, msg, rx_text, len);
+    /* Parser de byte (MSB3+LSB4) */
+    static bool    got_msb  = false;
+    static uint8_t tmp_byte = 0;
 
-        if (ok) {
-            return true;
+    float d = rx_get_duty_polling(RX_PIN, RX_TIMEOUT_MS);
+    if (d < 0.0f) return false;
+
+    /* IDLE (opcional) */
+    if (!receiving && codif_duty_match(d, CODIF_DUTY_IDLE)) {
+        return false;
+    }
+
+    /* START */
+    if (!receiving && codif_duty_match(d, CODIF_DUTY_START)) {
+        receiving = true;
+        idx = 0;
+        got_msb = false;   // reset parser
+        tmp_byte = 0;
+        // (no imprimir duty)
+        return false;
+    }
+
+    /* STOP */
+    if (receiving && codif_duty_match(d, CODIF_DUTY_STOP)) {
+        receiving = false;
+        got_msb = false;   // reset parser
+
+        if (idx < 1) return false;  // solo START/STOP -> inválido
+
+        /* Último byte es CHK7 */
+        uint8_t chk_rx   = rx_data[idx - 1];
+        uint8_t chk_calc = codif_checksum7(rx_data, (size_t)(idx - 1));
+
+        /* Copia payload a salida */
+        int data_len = idx - 1;
+        if (data_len > maxlen - 1) data_len = maxlen - 1;
+        for (int i = 0; i < data_len; i++) out[i] = (char)rx_data[i];
+        out[data_len] = '\0';
+
+        printf("[RX] CHK7: %s\n", (chk_rx == chk_calc) ? "OK" : "ERROR");
+        idx = 0;
+
+        /* SIEMPRE retorna true al ver STOP (imprime aunque falle checksum) */
+        return true;
+    }
+
+    /* Datos: dentro de las bandas MSB3/LSB4 */
+    if (receiving) {
+        if (d >= CODIF_DUTY_MIN_MSB3 && d <= CODIF_DUTY_MAX_MSB3) {
+            /* MSB3 */
+            tmp_byte = (uint8_t)(codif_duty_to_msb3(d) << 4);
+            got_msb = true;
+        } else if (d >= CODIF_DUTY_MIN_LSB4 && d <= CODIF_DUTY_MAX_LSB4) {
+            /* LSB4 */
+            if (got_msb) {
+                tmp_byte |= codif_duty_to_lsb4(d);
+                if (idx < MAX_LEN) rx_data[idx++] = tmp_byte;
+                got_msb = false;
+            }
+            /* else: llegó LSB sin MSB -> se ignora */
         }
+        /* else: fuera de bandas -> ignora (ruido/IDLE intermedio) */
     }
 
     return false;
-}
-
-/* ===== Consola ===== */
-static int read_line_usb(char* buf, int maxlen, uint32_t tout_ms) {
-    int n = 0;
-    uint32_t t0 = to_ms_since_boot(get_absolute_time());
-    
-    while (n < maxlen - 1) {
-        if ((to_ms_since_boot(get_absolute_time()) - t0) > tout_ms) break;
-        
-        int ch = getchar_timeout_us(1000);
-        if (ch == PICO_ERROR_TIMEOUT) continue;
-        if (ch == '\r' || ch == '\n') break;
-        
-        buf[n++] = (char)ch;
-    }
-    
-    buf[n] = 0;
-    return n;
-}
-
-static void print_help(void) {
-    printf("\n╔════════════════════════════════════════════════╗\n");
-    printf("║           COMANDOS - Half-Duplex              ║\n");
-    printf("╠════════════════════════════════════════════════╣\n");
-    printf("║ 1: <texto>     → Envía desde Nodo 1           ║\n");
-    printf("║ 2: <texto>     → Envía desde Nodo 2           ║\n");
-    printf("║ help           → Este menú                    ║\n");
-    printf("╚════════════════════════════════════════════════╝\n");
-}
-
-/* ===== MAIN ===== */
-int main(void) {
-    stdio_init_all();
-    sleep_ms(500);
-
-    // Inicializar TX
-    txpwm_t tx1, tx2;
-    txpwm_init(&tx1, TX1_PIN, F_PWM_HZ, PWM_TOP);
-    txpwm_init(&tx2, TX2_PIN, F_PWM_HZ, PWM_TOP);
-
-    // Inicializar RX
-    rx_in_init(RX1_PIN, 0, 0);
-    rx_in_init(RX2_PIN, 0, 0);
-    gpio_pull_down(RX1_PIN);
-    gpio_pull_down(RX2_PIN);
-
-    // Estado IDLE
-    txpwm_set_duty01(&tx1, UAPWMC_DUTY_IDLE);
-    txpwm_set_duty01(&tx2, UAPWMC_DUTY_IDLE);
-    sleep_ms(100);
-
-    uint tx_active = 1;
-
-    char line[LINE_MAX], msg[LINE_MAX], rx_text[LINE_MAX];
-
-    while (true) {
-        printf("\n[Nodo %u]> ", tx_active);
-        fflush(stdout);
-
-        int n = read_line_usb(line, LINE_MAX, 600000);
-        if (n <= 0) continue;
-
-        // Comando: help
-        if (!strncmp(line, "help", 4)) {
-            print_help();
-            continue;
-        }
-
-        // Atajos "1: ..." / "2: ..."
-        if ((line[0] == '1' && line[1] == ':') || 
-            (line[0] == '2' && line[1] == ':')) {
-            tx_active = (line[0] == '1') ? 1 : 2;
-            const char* p = line + 2;
-            while (*p == ' ') p++;
-            
-            if (strlen(p) == 0) {
-                printf("(mensaje vacío)\n");
-                continue;
-            }
-            
-            strncpy(msg, p, LINE_MAX - 1);
-            msg[LINE_MAX - 1] = 0;
-        } else {
-            printf("Comando no reconocido\n");
-            continue;
-        }
-
-        int m = (int)strlen(msg);
-
-        // Transmitir
-        printf("\n────────────────────────────────────────\n");
-        
-        bool success;
-        if (tx_active == 1) {
-            printf("Nodo 1 → Nodo 2\n");
-            success = link_send_with_retry(&tx1, RX2_PIN, msg, rx_text, m);
-        } else {
-            printf("Nodo 2 → Nodo 1\n");
-            success = link_send_with_retry(&tx2, RX1_PIN, msg, rx_text, m);
-        }
-
-        rx_text[m] = 0;
-
-        printf("\n📤 TX: \"%s\"\n", msg);
-        printf("📥 RX: \"%s\"\n", rx_text);
-
-        if (success) {
-            printf("\nTRANSMISIÓN EXITOSA\n");
-        } else {
-            printf("\nTRANSMISIÓN FALLIDA\n");
-            
-            // Mostrar hex dump para debug
-            printf("\nHex dump:\n");
-            printf("TX: ");
-            for (int i = 0; i < m; i++) printf("%02X ", (uint8_t)msg[i]);
-            printf("\nRX: ");
-            for (int i = 0; i < m; i++) printf("%02X ", (uint8_t)rx_text[i]);
-            printf("\n");
-        }
-        printf("────────────────────────────────────────\n");
-    }
-
-    return 0;
 }
